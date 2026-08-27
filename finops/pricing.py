@@ -77,6 +77,99 @@ def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount:
     return "on_demand"
 
 
+# ---------------------------------------------------------------------------
+# Extension 1 — smarter tier policy (interruption rate + 1yr vs 3yr horizon)
+# ---------------------------------------------------------------------------
+
+# Per-GPU-class per-hour spot reclamation probability (illustrative 2026).
+# Big, in-demand accelerators churn less on the neoclouds than small ones.
+SPOT_INTERRUPT_RATE = {
+    "H100": 0.02, "H200": 0.03, "B200": 0.04, "MI300X": 0.05,
+    "A100": 0.05, "A10G": 0.12, "L4": 0.15,
+}
+
+
+def recommend_tier_v2(
+    hours_per_day: float,
+    interruptible: bool,
+    job_days: float,
+    gpu_type: str | None = None,
+    reserved_1yr_discount: float = 0.20,
+    reserved_3yr_discount: float = 0.45,
+    spot_effective_discount: float = 0.40,
+    interrupt_rate: float | None = None,
+    high_churn_threshold: float = 0.10,
+) -> dict:
+    """Return a tier decision *and* its reasoning, unlike the one-word v1.
+
+    Two factors v1 ignores:
+      1. Interruption rate varies by GPU class. A 15%/hr reclaim rate on an L4
+         means near-constant rework — spot stops being a free lunch, so a
+         high-churn interruptible job is pushed to on-demand/reserved instead.
+      2. Reserved horizon. A 3-year commit only beats a 1-year commit if the
+         job actually lives long enough to amortise it. Short jobs that clear
+         the break-even duty cycle get 1yr; long ones get 3yr.
+    """
+    rate = interrupt_rate if interrupt_rate is not None else SPOT_INTERRUPT_RATE.get(gpu_type or "", 0.05)
+    duty = max(0.0, hours_per_day) / 24.0
+    be_3yr = break_even_utilization(reserved_3yr_discount)
+    be_1yr = break_even_utilization(reserved_1yr_discount)
+
+    if interruptible and hours_per_day < 24:
+        if rate <= high_churn_threshold:
+            return {"tier": "spot", "reserved_term": None,
+                    "reason": f"interruptible, low spot churn ({rate:.0%}/hr) -> ride the discount"}
+        # Too much rework to trust spot. Fall through on duty cycle.
+        if duty >= be_3yr:
+            term = "3yr" if job_days >= 365 else "1yr"
+            return {"tier": "reserved", "reserved_term": term,
+                    "reason": f"interruptible but high spot churn ({rate:.0%}/hr); steady duty {duty:.0%} -> reserved {term}"}
+        return {"tier": "on_demand", "reserved_term": None,
+                "reason": f"interruptible but high spot churn ({rate:.0%}/hr) and low duty {duty:.0%} -> on-demand"}
+
+    if duty >= be_3yr:
+        term = "3yr" if job_days >= 365 else "1yr"
+        disc = reserved_3yr_discount if term == "3yr" else reserved_1yr_discount
+        return {"tier": "reserved", "reserved_term": term,
+                "reason": f"steady duty {duty:.0%} >= break-even {be_3yr:.0%}; horizon {job_days:.0f}d -> reserved {term} (-{disc:.0%})"}
+    if duty >= be_1yr:
+        return {"tier": "reserved", "reserved_term": "1yr",
+                "reason": f"duty {duty:.0%} clears 1yr break-even {be_1yr:.0%} but not 3yr -> reserved 1yr"}
+    return {"tier": "on_demand", "reserved_term": None,
+            "reason": f"spiky / low duty {duty:.0%} -> on-demand"}
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_multiplier: float = 1.25,
+    read_discount: float = 0.10,
+) -> bool:
+    """Extension 3 — does prompt caching actually pay for a given prefix?
+
+    Writing a cache entry costs `write_cost_multiplier` x the normal input price
+    (a one-time surcharge). Each subsequent read is billed at `read_discount` x
+    price instead of 1.0x, saving (1 - read_discount) per read.
+
+    Net vs. never-caching, for N reads of a prefix of size 1 (normalised):
+        no-cache  : N * 1.0
+        cache     : write_cost_multiplier + N * read_discount
+    Cache wins when  N * (1 - read_discount) > (write_cost_multiplier - 1.0)
+    """
+    savings_per_read = 1.0 - read_discount
+    write_surcharge = write_cost_multiplier - 1.0
+    if savings_per_read <= 0:
+        return False
+    return avg_cache_reads * savings_per_read > write_surcharge
+
+
+def cache_break_even_reads(write_cost_multiplier: float = 1.25, read_discount: float = 0.10) -> float:
+    """Minimum number of reads per cached prefix for caching to break even."""
+    savings_per_read = 1.0 - read_discount
+    if savings_per_read <= 0:
+        return float("inf")
+    return (write_cost_multiplier - 1.0) / savings_per_read
+
+
 def spot_checkpoint_cost(
     job_hours: float,
     spot_hr: float,

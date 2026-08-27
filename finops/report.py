@@ -3,7 +3,8 @@ from __future__ import annotations
 
 
 def build_report(baseline_usd: float, optimized_usd: float, levers: dict,
-                 sustainability: dict | None = None, period: str = "monthly") -> str:
+                 sustainability: dict | None = None, period: str = "monthly",
+                 extra_sections: str | None = None) -> str:
     """Return a markdown cost-optimization report."""
     savings = baseline_usd - optimized_usd
     pct = (savings / baseline_usd * 100.0) if baseline_usd > 0 else 0.0
@@ -31,6 +32,8 @@ def build_report(baseline_usd: float, optimized_usd: float, levers: dict,
             f"- Carbon per query: {sustainability.get('carbon_g', 0):.3f} gCO2e",
             f"- Cheapest+cleanest region: {sustainability.get('best_region', 'n/a')}",
         ]
+    if extra_sections:
+        lines += ["", extra_sections.rstrip()]
     lines += ["", "_Figures are June-2026 as-of snapshots; re-baseline before acting._"]
     return "\n".join(lines)
 

@@ -45,3 +45,48 @@ def tokens_per_watt(total_tokens: int, wh: float, seconds: float = 1.0) -> float
     """Energy efficiency of serving: tokens per watt (higher is better)."""
     watts = (wh * 3600.0) / seconds if seconds > 0 else 0.0
     return total_tokens / watts if watts > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Extension 5 — carbon-aware scheduling for interruptible jobs
+# ---------------------------------------------------------------------------
+
+def region_table() -> list:
+    """One row per region with price, carbon and a blended rank (lower is better)."""
+    rows = []
+    max_p = max(REGION_PRICE_KWH.values())
+    max_c = max(REGION_CARBON.values())
+    for region in REGION_CARBON:
+        p = REGION_PRICE_KWH.get(region, 0.12)
+        c = REGION_CARBON[region]
+        rows.append({
+            "region": region,
+            "usd_per_kwh": p,
+            "gco2_per_kwh": c,
+            "blended_score": round(0.5 * p / max_p + 0.5 * c / max_c, 3),
+        })
+    return sorted(rows, key=lambda r: r["blended_score"])
+
+
+def cheapest_region() -> str:
+    return min(REGION_PRICE_KWH, key=REGION_PRICE_KWH.get)
+
+
+def cleanest_region() -> str:
+    return min(REGION_CARBON, key=REGION_CARBON.get)
+
+
+def relocate_job_carbon(job_kwh: float, from_region: str = "us-east-1", to_region: str | None = None) -> dict:
+    """gCO2e and $ saved by moving one job's energy draw to a cleaner region."""
+    to_region = to_region or cleanest_region()
+    from_c = carbon_g(job_kwh * 1000.0, from_region)
+    to_c = carbon_g(job_kwh * 1000.0, to_region)
+    from_usd = energy_cost_usd(job_kwh * 1000.0, from_region)
+    to_usd = energy_cost_usd(job_kwh * 1000.0, to_region)
+    return {
+        "from_region": from_region,
+        "to_region": to_region,
+        "carbon_saved_g": round(from_c - to_c, 1),
+        "carbon_cut_pct": round((1 - to_c / from_c) * 100, 1) if from_c else 0.0,
+        "energy_usd_saved": round(from_usd - to_usd, 4),
+    }
